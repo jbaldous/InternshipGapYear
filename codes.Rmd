@@ -1,0 +1,1580 @@
+---
+title: "Automatic Check ODK's form - ORCHAMP project"
+author: "Jules Baldous"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    number_sections: true
+    self_contained: true
+    lightbox: true
+    gallery: false
+    thumbnails: true
+    fig_width: 10
+    fig_height: 10
+  pdf_document: default
+---
+
+***Project Overview***
+
+- **Project**: ODK's form for ORCHAMP project
+- **Author**: Jules Baldous 
+- **Supervisor**: Giovanni Poggiato & Amélie Saillard
+- **Contract Start Date & End Date**: 01/10/2025 - 03/07/2026
+- **Overall Objective**: Create an automatic detector for potential mistakes in the filling of ODK's form. Implement this detector on the website of ORCHAMP.
+- **Tools**: Rstudio & ODK & ChatGPT
+- **Documentation**: https://docs.ropensci.org/ruODK/ --> To acces to the ODK's form with R.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F, error = TRUE)
+rm(list = ls())
+```
+
+Alt + O pour replier tout et ouvrir que ce qui est pertinent.
+
+**Package nécessaires à l'exécution de ce document :**
+
+```{r package, include=FALSE}
+library(dplyr)
+library(tibble)
+library(ruODK)
+library(stringr)
+```
+
+# Accès aux résultats des soumissions des formulaires ODK
+
+La première étape est d'accéder aux soumissions (en .csv) sur le site Central d'ODK.
+
+On ouvre une connection avec chaque formulaire pour les récupérer sous forme csv. Pour cela on a besoin de l'id et du mot de passe (de Giovanni en l'occurence). On les stocks les soumissions de chaque formulaire dans un dataframe nommé `soumission_Nom_Formulaire`.
+
+```{r}
+#Formulaire suivi de perturbations
+ru_setup(
+  svc = "https://odk.gedeop.inrae.fr/v1/projects/54/forms/orchamp_suiviperturbations.svc",  # formulaire sur serveur ODK
+  un = "giovanni.poggiato@univ-grenoble-alpes.fr",   # login
+  pw = "Rollelagrange1!"   # mot de passe
+)
+
+soumissions_suivi_perturbation <- ruODK::odata_submission_get()
+
+#Formulaire Intervention Camera trap ou acoustique Orchamp (V1.0)
+ru_setup(
+  svc = "https://odk.gedeop.inrae.fr/v1/projects/54/forms/orchamp_camtrap-acoustic_intervention.svc",  # formulaire sur serveur ODK
+  un = "giovanni.poggiato@univ-grenoble-alpes.fr",   # login
+  pw = "Rollelagrange1!"   # mot de passe
+)
+
+soumissions_intervention_camtrap_acoustic <- ruODK::odata_submission_get()
+
+#Formulaire installation/remplacement Hobo et Tomst
+ru_setup(
+  svc = "https://odk.gedeop.inrae.fr/v1/projects/54/forms/orchamp_tomsthobo_plot_beta.svc",  # formulaire sur serveur ODK
+  un = "giovanni.poggiato@univ-grenoble-alpes.fr",   # login
+  pw = "Rollelagrange1!"   # mot de passe
+)
+
+soumissions_install_replacement_HOBO_Tomst <- ruODK::odata_submission_get()
+
+#Formulaire Installation Enregistreurs acoustiques Orchamp (V1.0)
+ru_setup(
+  svc = "https://odk.gedeop.inrae.fr/v1/projects/54/forms/orchamp_audiotrap_v1.0.svc",  # formulaire sur serveur ODK
+  un = "giovanni.poggiato@univ-grenoble-alpes.fr",   # login
+  pw = "Rollelagrange1!"   # mot de passe
+)
+
+soumissions_install_acoustic <- ruODK::odata_submission_get()
+
+#Formulaire Installation Camera traps Orchamp (V1.0)
+ru_setup(
+  svc = "https://odk.gedeop.inrae.fr/v1/projects/54/forms/orchamp_camtrap_v1.0.svc",  # formulaire sur serveur ODK
+  un = "giovanni.poggiato@univ-grenoble-alpes.fr",   # login
+  pw = "Rollelagrange1!"   # mot de passe
+)
+
+soumissions_install_camtrap <- ruODK::odata_submission_get()
+
+#Formulaire echantillonage sol superficiel et eDNA
+ru_setup(
+  svc = "https://odk.gedeop.inrae.fr/v1/projects/54/forms/orchamp_soil_edna.svc",  # formulaire sur serveur ODK
+  un = "giovanni.poggiato@univ-grenoble-alpes.fr",   # login
+  pw = "Rollelagrange1!"   # mot de passe
+)
+
+soumissions_eDNA <- ruODK::odata_submission_get()
+```
+
+# Détection des incohérences
+
+Pour chaque formulaire on va faire tourner un script différent pour analyser les potentielles erreurs.
+
+Pour cela il est utile d'avoir deux listes avec : 
+
+- Le nom de toutes les placettes ORCHAMP (`all_plot`).
+- Le nom de toutes les placettes théoriquement effectuées jusqu'à maintenant (`plot_2025`). Pour cela on se base sur tous les gradient visitées cette année. Ceci peut amener des faux positifs dans la détection car toutes les placettes d'un gradient ne sont pas forcément visitées sur une saison, sans que ce soit une erreur de saisie.
+
+```{r}
+# Téléchargement de toutes les placettes
+library(jsonlite)
+Data = fromJSON("https://orchamp.osug.fr/api/plots/all")
+
+all_plot <- as.data.frame(Data$codeplot)
+
+# Gradient sur l'année 2025
+gradient_2025 <- c("SAL", "GAM", "TRU", "SOB", "FUO", "STE", "CHAV", "CAV", "TER", "ESE", "TIM", "PET", "PIB", "MNT", "CAU", "VTS", "ARG", "LORI", "PAI", "ANT", "LAU", "NEV", "VAL")
+
+# On extrait tous les noms de gradients dans all_plot
+names_grad_all <- str_extract(all_plot$`Data$codeplot`, "^[^_]+")
+
+# Garder uniquement les placettes correspondant aux gradients visités en 2025
+plot_2025 <- as.data.frame(all_plot[names_grad_all %in% gradient_2025, ])
+```
+
+## Vérification du formulaire de suivi des perturbations
+
+### Vérification des placettes visitées
+
+On commence par vérifier que les placettes visitées dans le formulaire sont dans `all_plot` (car on doit visiter tous les ans). Si il y en a qui ne sont pas dedans on les flag. Si des placettes de `all_plot` manque dans suivi de perturbations on le flag aussi.
+
+```{r}
+# On bosse sur une valeur des plots dans les soumissions concaténées entre les colonnes new et non new
+soumissions_suivi_perturbation_replaced <- soumissions_suivi_perturbation %>%
+  mutate(
+    infos_plot_plot = ifelse(infos_plot_plot == "new", infos_plot_new_plot, infos_plot_plot)
+  )
+
+# Placette non visitées cette année
+sp_plot_not_visited <- as.data.frame(all_plot[!(all_plot$`Data$codeplot` %in% soumissions_suivi_perturbation_replaced$infos_plot_plot),])
+
+# Placette avec nom erronés (pas dans les noms théorique)
+sp_plot_name_error <- soumissions_suivi_perturbation_replaced[(!(soumissions_suivi_perturbation_replaced$infos_plot_plot %in% all_plot$`all_plot[names_grad_all %in% gradient_2025, ]`)&!(soumissions_suivi_perturbation_replaced$infos_plot_plot %in%all_plot$`Data$codeplot`)),"infos_plot_plot"]
+```
+
+On va aussi noter les placettes visitées en doublons.
+
+```{r}
+sp_doublons <- soumissions_suivi_perturbation_replaced %>%
+  dplyr::group_by(infos_plot_plot) %>%
+  dplyr::summarise(nb_occurrences = n(), .groups = "drop") %>%
+  dplyr::filter(nb_occurrences != 1)
+```
+
+### Remarques notées
+
+On isole les remarques faites dans les formulaires. On renvoie les placettes avec des commentaires en fonction du type de commentaires.
+
+#### Remarques sur l'installation des bornes de la placette
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques_borne <- c("infos_marks_marquage_rmq20_remarks", "infos_marks_marquage_rmq10_remarks", "infos_marks_marquage_bi4_remarks","infos_marks_marquage_bi3_remarks", "infos_marks_marquage_bi2_remarks", "infos_marks_marquage_bi1_remarks", "infos_marks_borne_b_remarks", "infos_marks_marquage_bs1_remarks", "infos_marks_marquage_bs2_remarks", "infos_marks_marquage_bs3_remarks", "infos_marks_marquage_ai4_remarks", "infos_marks_marquage_ai3_remarks", "infos_marks_marquage_ai2_remarks", "infos_marks_marquage_ai1_remarks", "infos_marks_borne_a_remarks", "infos_marks_marquage_as1_remarks","infos_marks_marquage_as2_remarks","infos_marks_marquage_as3_remarks")  # à adapter en fonction du formulaire
+
+sp_remarks_borne <- soumissions_suivi_perturbation_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques_borne)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques_borne
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("^infos_marks_|_remarks$", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+#### Remarques sur les capteurs de température
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques_capteur <- c("infos_sensor_sensor_remarks", "infos_sensor_junction_box_remarks")  # à adapter en fonction du formulaire
+
+sp_remarks_capteur <- soumissions_suivi_perturbation_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques_capteur)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques_capteur
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("^infos_sensor_|_remarks$", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+#### Remarques sur le paturage
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques_paturage <- c("infos_grazing_grazing_remarks")  # à adapter en fonction du formulaire
+
+sp_remarks_paturage <- soumissions_suivi_perturbation_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques_paturage)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques_paturage
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("^infos_grazing_|_remarks$", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+#### Remarques sur d'éventuelles perturbations
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques_perturbation <- c("infos_perturbations_perturbation_other")  # à adapter en fonction du formulaire
+
+sp_remarks_perturbation <- soumissions_suivi_perturbation_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques_perturbation)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques_perturbation
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("^infos_perturbations_|_other$", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+### Formulaire Edition
+
+On récupère les placettes éditées.
+
+```{r}
+sp_plot_edited <- soumissions_suivi_perturbation_replaced %>%
+  dplyr::filter(system_review_state == "edited") %>%
+  dplyr::select(infos_plot_plot)
+```
+
+### Ecriture de l'output
+
+```{r}
+# Nom du formulaire
+nom_formulaire <- "suivi_perturbation"
+
+# Fichier de sortie
+fichier_sortie <- "ODK_checks_report.txt"
+
+# Écriture dans le fichier texte
+sink(fichier_sortie)  # ouvrir le fichier pour écriture
+
+cat("========================================\n")
+cat("FORMULAIRE :", nom_formulaire, "\n")
+cat("Rapport de vérification automatique des soumissions ODK\n")
+cat("========================================\n\n")
+
+########################################################
+
+# Résultat du check des placettes à visiter
+check <- "Placettes non-visitées en 2025 (mais qui aurait dû)"
+
+cat("# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(sp_plot_not_visited$`all_plot[!(all_plot$\`Data$codeplot\` %in% soumissions_suivi_perturbation_replaced$infos_plot_plot), ]`) == 0) {
+  cat("Toutes les placettes à visiter ont été visitées.\n")
+} else {
+  cat(paste("-", sp_plot_not_visited$`all_plot[!(all_plot$\`Data$codeplot\` %in% soumissions_suivi_perturbation_replaced$infos_plot_plot), ]`), sep = "\n")
+}
+
+# Résultat du check des erreurs de nom de placette
+check <- "Placettes mal nommées"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(sp_plot_name_error$infos_plot_plot) == 0) {
+  cat("Aucune erreur dans le nom des placettes.\n")
+} else {
+  cat(paste("-", sp_plot_name_error$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des doublons de noms de placette
+check <- "Placettes présentes plus de 1 fois"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(sp_doublons) == 0) {
+  cat("Toutes les placettes apparaissent 1 fois exactement.\n")
+} else {
+  invisible(apply(sp_doublons, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["nb_occurrences"], " occurrences\n"))
+  }))
+}
+
+# Résultat du check des remarques sur le marquage
+check <- "Remarques sur le marquage détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(sp_remarks_borne) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(sp_remarks_borne, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des remarques sur les capteurs
+check <- "Remarques sur les capteurs détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(sp_remarks_capteur) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(sp_remarks_capteur, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des remarques sur le pâturage
+check <- "Remarques sur le pâturage détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(sp_remarks_paturage) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(sp_remarks_paturage, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des remarques sur les perturbations
+check <- "Remarques sur une éventuelle perturbation détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(sp_remarks_perturbation) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(sp_remarks_perturbation, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des éditions
+check <- "Placettes dont la soumission a été éditée"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(sp_plot_edited) == 0) {
+  cat("Aucune placette éditée.\n")
+} else {
+  cat(paste("-", sp_plot_edited$infos_plot_plot), sep = "\n")
+  }
+
+#####################################################
+
+cat("\nFin du rapport pour ce formulaire.\n\n\n")
+
+sink()  # fermer le fichier
+```
+
+## Vérification du formulaire d'installation/remplacement des HOBO/Tomst
+
+### Vérification des placettes visitées
+
+On commence par vérifier que les placettes visitées dans le formulaire sont dans `all_plot`. Si il y en a qui ne sont pas dedans on les flag. Si des placettes de `all_plot` manque dans suivi de perturbations on le flag aussi.
+
+```{r}
+# On bosse sur une valeur des plots dans les soumissions concaténées entre les colonnes new et non new
+soumissions_install_replacement_HOBO_Tomst_replaced <- soumissions_install_replacement_HOBO_Tomst %>%
+  mutate(
+    infos_plot_plot = ifelse(infos_plot_plot == "new", infos_plot_new_plot, infos_plot_plot)
+  )
+
+# Placette non visitées
+irht_plot_not_visited <- as.data.frame(all_plot[!(all_plot$`Data$codeplot` %in% soumissions_install_replacement_HOBO_Tomst_replaced$infos_plot_plot),])
+
+# Placette avec nom erronés (pas dans les noms théorique)
+irht_plot_name_error <- soumissions_install_replacement_HOBO_Tomst_replaced[(!(soumissions_install_replacement_HOBO_Tomst_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`)&!(soumissions_install_replacement_HOBO_Tomst_replaced$infos_plot_plot %in%all_plot$`Data$codeplot`)),"infos_plot_plot"]
+```
+
+On va aussi noter les placettes visitées en doublons.
+
+```{r}
+irht_doublons <- soumissions_install_replacement_HOBO_Tomst_replaced %>%
+  dplyr::group_by(infos_plot_plot) %>%
+  dplyr::summarise(nb_occurrences = n(), .groups = "drop") %>%
+  dplyr::filter(nb_occurrences != 2)
+```
+
+### Remarques notées
+
+On note les remarques sur l'emplacement du HOBO/TOMST.
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques <- c("gps_infos_comment_sensor")  # à adapter en fonction du formulaire
+
+irht_remarks <- soumissions_install_replacement_HOBO_Tomst_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("^gps_infos_", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+### Formulaire Edition
+
+On récupère les placettes éditées.
+
+```{r}
+irht_plot_edited <- soumissions_install_replacement_HOBO_Tomst_replaced %>%
+  dplyr::filter(system_review_state == "edited") %>%
+  dplyr::select(infos_plot_plot)
+```
+
+### Incohérences Numéro de série
+
+On veut spotter quand on a échangé la case TOMST (TMS95.../TMS94...) et HOBO (20...).
+
+```{r}
+# Détection des motifs
+is_hobo <- function(x) grepl("^(10|20)", x, ignore.case = TRUE)
+is_tomst <- function(x) grepl("^(TMS|94|95)", x, ignore.case = TRUE)
+
+# On filtre uniquement les lignes avec inversion
+inversions <- soumissions_install_replacement_HOBO_Tomst_replaced %>%
+  filter(
+    # HOBO dans colonnes TOMST
+    (is_hobo(sensors_serial_num_tomst_old) | is_hobo(sensors_serial_num_tomst_new)) |
+    # TOMST dans colonnes HOBO
+    (is_tomst(sensors_serial_num_hobo_old) | is_tomst(sensors_serial_num_hobo_new))
+  ) %>%
+  select(infos_plot_plot)
+```
+
+On veut aussi spoter les placettes où il faut rajouter TMS
+
+```{r}
+# Fonction : TOMST sans TMS
+tomst_sans_tms <- function(x) {
+  grepl("^(94|95)", x, ignore.case = TRUE) & !grepl("^TMS", x, ignore.case = TRUE)
+}
+
+# On cherche les lignes concernées
+tms_a_ajouter <- soumissions_install_replacement_HOBO_Tomst_replaced %>%
+  filter(
+    tomst_sans_tms(sensors_serial_num_tomst_old) |
+    tomst_sans_tms(sensors_serial_num_tomst_new)
+  ) %>%
+  select(infos_plot_plot)
+```
+
+
+### Ecriture de l'output
+
+```{r}
+# Nom du formulaire
+nom_formulaire <- "installation_remplacement_HOBO_Tomst"
+
+# Fichier de sortie
+fichier_sortie <- "ODK_checks_report.txt"
+
+# Écriture dans le fichier texte
+sink(fichier_sortie, append = TRUE)  # ouvrir le fichier pour ajout (sans écrasement) d'écriture 
+
+cat("========================================\n")
+cat("FORMULAIRE :", nom_formulaire, "\n")
+cat("Rapport de vérification automatique des soumissions ODK\n")
+cat("========================================\n\n")
+
+########################################################
+
+# Résultat du check des placettes à visiter
+check <- "Placettes non-visitées en 2025 (mais qui aurait dû)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(irht_plot_not_visited$`all_plot[!(all_plot$\`Data$codeplot\` %in% soumissions_install_replacement_HOBO_Tomst_replaced$infos_plot_plot), ]`) == 0) {
+  cat("Toutes les placettes à visiter ont été visitées.\n")
+} else {
+  cat(paste("-", irht_plot_not_visited$`all_plot[!(all_plot$\`Data$codeplot\` %in% soumissions_install_replacement_HOBO_Tomst_replaced$infos_plot_plot), ]`), sep = "\n")
+}
+
+# Résultat du check des erreurs de nom de placette
+check <- "Placettes mal nommées"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(irht_plot_name_error$infos_plot_plot) == 0) {
+  cat("Aucune erreur dans le nom des placettes.\n")
+} else {
+  cat(paste("-", irht_plot_name_error$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des doublons et manquement de noms de placette
+check <- "Placettes présentes pas 2 fois (doublons + manque de visite + pas installé)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(irht_doublons) == 0) {
+  cat("Toutes les placettes apparaissent exactement 2 fois.\n")
+} else {
+  invisible(apply(irht_doublons, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["nb_occurrences"], " occurrence(s)\n"))
+  }))
+}
+
+# Résultat du check des remarques sur l'emplacement du capteur
+check <- "Remarques sur l'emplacement du HOBO/Tomst détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(irht_remarks) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(irht_remarks, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des éditions
+check <- "Placettes dont la soumission a été éditée"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(irht_plot_edited) == 0) {
+  cat("Aucune placette éditée.\n")
+} else {
+  cat(paste("-", irht_plot_edited$infos_plot_plot), sep = "\n")
+}
+
+# Résultat de l'inversion entre numéro de série TOMST et HOBO
+check <- "Placettes où il faut ajouter le TMS sur le numéro de série du TOMST"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(inversions) == 0) {
+  cat("Aucune inversion détectée entre HOBO et TOMST.\n")
+} else {
+  cat("Placettes avec inversion entre HOBO et TOMST :\n")
+  cat(paste0("- ", inversions$infos_plot_plot, collapse = "\n"), "\n")
+}
+
+# Résultat du rajout des TMS sur les numéros de série
+check <- "Placettes où il faut ajouter le TMS sur le numéro de série du TOMST"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(tms_a_ajouter) == 0) {
+  cat("Aucune placette nécessitant l'ajout de 'TMS' détectée.\n")
+} else {
+  cat("Placettes où il faut ajouter 'TMS' aux numéros TOMST :\n")
+  cat(paste0("- ", tms_a_ajouter$infos_plot_plot, collapse = "\n"), 
+      "\n")
+}
+
+#####################################################
+
+cat("\nFin du rapport pour ce formulaire.\n\n\n")
+
+sink()  # fermer le fichier
+```
+
+## Vérification du formulaire de eDNA
+
+### Vérification des placettes visitées
+
+On commence par vérifier que les placettes visitées dans le formulaire sont dans `plot_2025`. Si il y en a qui ne sont pas dedans on les flag. Si des placettes de `plot_2025` manque dans suivi de perturbations on le flag aussi.
+
+```{r}
+# On bosse sur une valeur des plots dans les soumissions concaténées entre les colonnes new et non new
+soumissions_eDNA_replaced <- soumissions_eDNA %>%
+  mutate(
+    infos_plot_plot = ifelse(infos_plot_plot == "new", infos_plot_new_plot, infos_plot_plot)
+  )
+
+# Placette non visitées alors que dans la liste des gradients à faire
+se_plot_not_visited <- as.data.frame(plot_2025[!(plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]` %in% soumissions_eDNA_replaced$infos_plot_plot),])
+
+# Placette avec nom erronés (pas dans les noms théorique)
+se_plot_name_error <- soumissions_eDNA_replaced[(!(soumissions_eDNA_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`)&!(soumissions_eDNA_replaced$infos_plot_plot %in%all_plot$`Data$codeplot`)),"infos_plot_plot"]
+
+# Placette visitées mais pas dans la liste des gradients à faire
+se_plot_supplementary_visited <- soumissions_eDNA_replaced[!(soumissions_eDNA_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`),"infos_plot_plot"]
+
+# On enlève les erreurs de ce dataframe (car on les prend en compte avant)
+se_plot_supplementary_visited <- se_plot_supplementary_visited[!se_plot_supplementary_visited$infos_plot_plot %in% se_plot_name_error$infos_plot_plot, , drop = FALSE]
+```
+
+On va aussi noter les placettes visitées en doublons.
+
+```{r}
+se_doublons <- soumissions_eDNA_replaced %>%
+  dplyr::group_by(infos_plot_plot) %>%
+  dplyr::summarise(nb_occurrences = n(), .groups = "drop") %>%
+  dplyr::filter(nb_occurrences != 1)
+```
+
+### Remarques notées
+
+On note les remarques sur le sampling de la terre.
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques <- c("sampling_remarks")  # à adapter en fonction du formulaire
+
+se_remarks <- soumissions_eDNA_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("_remarks$", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+### Formulaire Edition
+
+On récupère les placettes éditées.
+
+```{r}
+se_plot_edited <- soumissions_eDNA_replaced %>%
+  dplyr::filter(system_review_state == "edited") %>%
+  dplyr::select(infos_plot_plot)
+```
+
+### Ecriture de l'output
+
+```{r}
+# Nom du formulaire
+nom_formulaire <- "suivi_eDNA"
+
+# Fichier de sortie
+fichier_sortie <- "ODK_checks_report.txt"
+
+# Écriture dans le fichier texte
+sink(fichier_sortie, append = TRUE)  # ouvrir le fichier pour écriture
+
+cat("========================================\n")
+cat("FORMULAIRE :", nom_formulaire, "\n")
+cat("Rapport de vérification automatique des soumissions ODK\n")
+cat("========================================\n\n")
+
+########################################################
+
+# Résultat du check des placettes à visiter
+check <- "Placettes non-visitées en 2025 (mais qui aurait dû)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(se_plot_not_visited$`plot_2025[!(plot_2025$\`all_plot[names_grad_all %in% gradient_2025, ]\` %in% soumissions_eDNA_replaced$infos_plot_plot), ]`) == 0) {
+  cat("Toutes les placettes à visiter ont été visitées.\n")
+} else {
+  cat(paste("-", se_plot_not_visited$`plot_2025[!(plot_2025$\`all_plot[names_grad_all %in% gradient_2025, ]\` %in% soumissions_eDNA_replaced$infos_plot_plot), ]`), sep = "\n")
+}
+
+# Résultat du check des erreurs de nom de placette
+check <- "Placettes mal nommées"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(se_plot_name_error$infos_plot_plot) == 0) {
+  cat("Aucune erreur dans le nom des placettes.\n")
+} else {
+  cat(paste("-", se_plot_name_error$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des placettes visitées en suppléments
+check <- "Placettes visitées en supplément"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(se_plot_supplementary_visited$infos_plot_plot) == 0) {
+  cat("Aucune placette n'a été visitée en supplément.\n")
+} else {
+  cat(paste("-", se_plot_supplementary_visited$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des doublons et manquement de noms de placette
+check <- "Placettes présentes pas 1 fois"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(se_doublons) == 0) {
+  cat("Toutes les placettes apparaissent 1 fois exactement.\n")
+} else {
+  invisible(apply(se_doublons, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["nb_occurrences"], " occurrences\n"))
+  }))
+}
+
+# Résultat du check des remarques sur l'emplacement du capteur
+check <- "Remarques sur le sampling de terre détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(se_remarks) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(se_remarks, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des éditions
+check <- "Placettes dont la soumission a été éditée"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(se_plot_edited) == 0) {
+  cat("Aucune placette éditée.\n")
+} else {
+  cat(paste("-", se_plot_edited$infos_plot_plot), sep = "\n")
+  }
+#####################################################
+
+cat("\nFin du rapport pour ce formulaire.\n\n\n")
+
+sink()  # fermer le fichier
+```
+
+## Vérification du formulaire d'installation des camtraps
+
+### Vérification des placettes visitées
+
+On commence par vérifier que les placettes visitées dans le formulaire sont dans `plot_2025`. Si il y en a qui ne sont pas dedans on les flag. Si des placettes de `plot_2025` manque dans suivi de perturbations on le flag aussi.
+
+```{r}
+# On bosse sur une valeur des plots dans les soumissions concaténées entre les colonnes new et non new
+soumissions_install_camtrap_replaced <- soumissions_install_camtrap %>%
+  mutate(
+    infos_plot_plot = ifelse(infos_plot_plot == "new", infos_plot_new_plot, infos_plot_plot)
+  )
+
+# Placette non visitées alors que dans la liste des gradients à faire
+ic_plot_not_visited <- as.data.frame(plot_2025[!(plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]` %in% soumissions_install_camtrap_replaced$infos_plot_plot),])
+
+# Placette avec nom erronés (pas dans les noms théorique)
+ic_plot_name_error <- soumissions_install_camtrap_replaced[(!(soumissions_install_camtrap_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`)&!(soumissions_install_camtrap_replaced$infos_plot_plot %in%all_plot$`Data$codeplot`)),"infos_plot_plot"]
+
+# Placette visitées mais pas dans la liste des gradients à faire
+ic_plot_supplementary_visited <- soumissions_install_camtrap_replaced[!(soumissions_install_camtrap_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`),"infos_plot_plot"]
+
+# On enlève les erreurs de ce dataframe (car on les prend en compte avant)
+ic_plot_supplementary_visited <- ic_plot_supplementary_visited[!ic_plot_supplementary_visited$infos_plot_plot %in% ic_plot_name_error$infos_plot_plot, , drop = FALSE]
+```
+
+On va aussi noter les placettes visitées en doublons.
+
+```{r}
+ic_doublons <- soumissions_install_camtrap_replaced %>%
+  dplyr::group_by(infos_plot_plot) %>%
+  dplyr::summarise(nb_occurrences = n(), .groups = "drop") %>%
+  dplyr::filter(nb_occurrences != 2)
+```
+
+On récupère aussi le nom des placettes visitées pour pouvoir les comparer à ceux présents dans le formulaire d'intervention.
+
+```{r}
+placette_camtraps <- soumissions_install_camtrap_replaced$infos_plot_plot
+```
+
+### Remarques notées
+
+On note les remarques sur l'installation des caméras.
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques <- c("context_installation_indices_infos_comment")  # à adapter en fonction du formulaire
+
+ic_remarks <- soumissions_install_camtrap_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("^context_|_indices_infos_comment$", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+### Formulaire Edition
+
+On récupère les placettes éditées.
+
+```{r}
+ic_plot_edited <- soumissions_install_camtrap_replaced %>%
+  dplyr::filter(system_review_state == "edited") %>%
+  dplyr::select(infos_plot_plot)
+```
+
+### Vérification des noms théoriques des installations
+
+On commence par créer pour chaque placette le nom théorique des appareils sur celle-ci
+
+```{r}
+all_plot_theoric_name <- all_plot %>%
+  # Extraire le code site (avant le "_")
+  mutate(site = str_extract(Data$codeplot, "^[A-Z]+")) %>%
+  group_by(site) %>%
+  # Créer un rang par site
+  mutate(rang = row_number()) %>%
+  ungroup() %>%
+  # Créer les noms théoriques
+  mutate(
+    acoustique = paste0(site, rang),
+    cam1 = paste0(site, rang, "1"),
+    cam2 = paste0(site, rang, "2"),
+    all_appareil = paste(acoustique, cam1, cam2, sep = ", ")
+  )
+```
+
+Maintenant on va récupérer pour chaque placettes (donc possiblement deux placettes à la fois) et checker que les noms des camtrap (`infos_camtrap_id_camtrap`) sont dans la liste de nom théorique crées ci-dessus.
+
+```{r}
+incoherences_cam <- lapply(unique(soumissions_install_camtrap_replaced$infos_plot_plot), function(placette) {
+  
+  # lignes correspondantes à cette placette
+  lignes <- soumissions_install_camtrap_replaced %>%
+    filter(infos_plot_plot == placette)
+  
+  # noms donnés dans les soumissions
+  noms_donnes <- sort(unique(na.omit(trimws(lignes$infos_camtrap_id_camtrap))))
+  if (length(noms_donnes) == 0) return(NULL)
+  
+  # noms théoriques attendus
+  noms_attendus <- sort(unique(na.omit(c(
+    all_plot_theoric_name$cam1[all_plot_theoric_name$`Data$codeplot` == placette],
+    all_plot_theoric_name$cam2[all_plot_theoric_name$`Data$codeplot` == placette]
+  ))))
+  
+  # Si une seule caméra est installée, on vérifie juste que le nom est bien orthographié
+  if (length(noms_donnes) == 1) {
+    if (noms_donnes %in% noms_attendus) {
+      return(NULL)  # Nom correct → pas d’incohérence
+    } else {
+      return(list(
+        placette = placette,
+        erreur = "Nom mal orthographié ou non conforme",
+        donnes = noms_donnes,
+        attendus = paste(noms_attendus, collapse = ", ")
+      ))
+    }
+  }
+  
+  # Si deux caméras installées → vérification stricte (sensibilité à la casse)
+  mauvais_noms <- noms_donnes[!noms_donnes %in% noms_attendus]
+  
+  if (length(mauvais_noms) > 0) {
+    list(
+      placette = placette,
+      noms_mal_orthographiés = paste(mauvais_noms, collapse = ", "),
+      donnes = paste(noms_donnes, collapse = ", "),
+      attendus = paste(noms_attendus, collapse = ", ")
+    )
+  } else {
+    NULL
+  }
+}) %>%
+  purrr::compact() %>%
+  dplyr::bind_rows()
+```
+
+### Ecriture de l'output
+
+```{r}
+# Nom du formulaire
+nom_formulaire <- "installation_camtraps"
+
+# Fichier de sortie
+fichier_sortie <- "ODK_checks_report.txt"
+
+# Écriture dans le fichier texte
+sink(fichier_sortie, append = TRUE)  # ouvrir le fichier pour ajout (sans écrasement) d'écriture 
+
+cat("========================================\n")
+cat("FORMULAIRE :", nom_formulaire, "\n")
+cat("Rapport de vérification automatique des soumissions ODK\n")
+cat("========================================\n\n")
+
+########################################################
+
+# Résultat du check des placettes à visiter
+check <- "Placettes non-visitées en 2025 (mais qui aurait dû)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ic_plot_not_visited$`plot_2025[!(plot_2025$\`all_plot[names_grad_all %in% gradient_2025, ]\` %in% soumissions_install_camtrap_replaced$infos_plot_plot), ]`) == 0) {
+  cat("Toutes les placettes à visiter ont été visitées.\n")
+} else {
+  cat(paste("-", ic_plot_not_visited$`plot_2025[!(plot_2025$\`all_plot[names_grad_all %in% gradient_2025, ]\` %in% soumissions_install_camtrap_replaced$infos_plot_plot), ]`), sep = "\n")
+}
+
+# Résultat du check des erreurs de nom de placette
+check <- "Placettes mal nommées"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ic_plot_name_error$infos_plot_plot) == 0) {
+  cat("Aucune erreur dans le nom des placettes.\n")
+} else {
+  cat(paste("-", ic_plot_name_error$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des placettes visitées en suppléments
+check <- "Placettes visitées en supplément"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ic_plot_supplementary_visited$infos_plot_plot) == 0) {
+  cat("Aucune placette n'a été visitée en supplément.\n")
+} else {
+  cat(paste("-", ic_plot_supplementary_visited$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des doublons et manquement de noms de placette
+check <- "Placettes présentes pas 2 fois (doublons + manque de visite + pas installé)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ic_doublons) == 0) {
+  cat("Toutes les placettes apparaissent 2 fois exactement.\n")
+} else {
+  invisible(apply(ic_doublons, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["nb_occurrences"], " occurrences\n"))
+  }))
+}
+
+# Résultat du check des remarques sur l'installation des caméras
+check <- "Remarques sur l'installation de la caméra détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ic_remarks) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(ic_remarks, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des éditions
+check <- "Placettes dont la soumission a été éditée"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ic_plot_edited) == 0) {
+  cat("Aucune placette éditée.\n")
+} else {
+  cat(paste("-", ic_plot_edited$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des incohérences de nomenclature des caméras
+check <- "Placettes dont le nom de caméras ne correspond pas à la théorie (nom erroné)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(incoherences_cam) == 0) {
+  cat("Tous les identifiants de caméras sont conformes aux noms théoriques.\n")
+} else {
+  invisible(apply(incoherences_cam, 1, function(ligne) {
+    cat(paste0("- ", ligne["placette"], 
+               " → donné(s) : ", ligne["donnes"], 
+               ", attendu(s) : ", ligne["attendus"], "\n"))
+  }))
+}
+
+#####################################################
+
+cat("\nFin du rapport pour ce formulaire.\n\n\n")
+
+sink()  # fermer le fichier
+```
+
+## Vérification du formulaire d'installation des acoustiques
+
+### Vérification des placettes visitées
+
+On commence par vérifier que les placettes visitées dans le formulaire sont dans `plot_2025`. Si il y en a qui ne sont pas dedans on les flag. Si des placettes de `plot_2025` manque dans suivi de perturbations on le flag aussi.
+
+```{r}
+# On bosse sur une valeur des plots dans les soumissions concaténées entre les colonnes new et non new
+soumissions_install_acoustic_replaced <- soumissions_install_acoustic %>%
+  mutate(
+    infos_plot_plot = ifelse(infos_plot_plot == "new", infos_plot_new_plot, infos_plot_plot)
+  )
+
+# Placette non visitées alors que dans la liste des gradients à faire
+ia_plot_not_visited <- as.data.frame(plot_2025[!(plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]` %in% soumissions_install_acoustic_replaced$infos_plot_plot),])
+
+# Placette avec nom erronés (pas dans les noms théorique)
+ia_plot_name_error <- soumissions_install_acoustic_replaced[(!(soumissions_install_acoustic_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`)&!(soumissions_install_acoustic_replaced$infos_plot_plot %in%all_plot$`Data$codeplot`)),"infos_plot_plot"]
+
+# Placette visitées mais pas dans la liste des gradients à faire
+ia_plot_supplementary_visited <- soumissions_install_acoustic_replaced[!(soumissions_install_acoustic_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`),"infos_plot_plot"]
+
+# On enlève les erreurs de ce dataframe (car on les prend en compte avant)
+ia_plot_supplementary_visited <- ia_plot_supplementary_visited[!ia_plot_supplementary_visited$infos_plot_plot %in% ia_plot_name_error$infos_plot_plot, , drop = FALSE]
+```
+
+On va aussi noter les placettes visitées en doublons.
+
+```{r}
+ia_doublons <- soumissions_install_acoustic_replaced %>%
+  dplyr::group_by(infos_plot_plot) %>%
+  dplyr::summarise(nb_occurrences = n(), .groups = "drop") %>%
+  dplyr::filter(nb_occurrences != 1)
+```
+
+On récupère aussi le nom des placettes visitées pour pouvoir les comparer à ceux présents dans le formulaire d'intervention.
+
+```{r}
+placette_acoustic <- soumissions_install_acoustic_replaced$infos_plot_plot
+```
+
+### Remarques notées
+
+On note les remarques sur l'installation des pièges acoustiques.
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques <- c("comment")  # à adapter en fonction du formulaire
+
+ia_remarks <- soumissions_install_acoustic_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+### Formulaire Edition
+
+On récupère les placettes éditées.
+
+```{r}
+ia_plot_edited <- soumissions_install_acoustic_replaced %>%
+  dplyr::filter(system_review_state == "edited") %>%
+  dplyr::select(infos_plot_plot)
+```
+
+
+### Vérification des noms théoriques lors de l'installation des acoustiques
+
+```{r}
+incoherences_acoustic <- lapply(unique(soumissions_install_acoustic_replaced$infos_plot_plot), function(placette) {
+  
+  lignes <- soumissions_install_acoustic_replaced %>%
+    filter(infos_plot_plot == placette)
+  
+  noms_donnes <- sort(unique(lignes$infos_camtrap_id_camtrap))
+  nom_attendu <- all_plot_theoric_name$acoustique[all_plot_theoric_name$`Data$codeplot` == placette]
+  
+  if (!setequal(toupper(noms_donnes), toupper(nom_attendu))) {
+    list(placette = placette,
+         donnes = paste(noms_donnes, collapse = ", "),
+         attendus = nom_attendu)
+  } else {
+    NULL
+  }
+}) %>%
+  purrr::compact() %>%
+  dplyr::bind_rows()
+```
+
+### Ecriture de l'output
+
+```{r}
+# Nom du formulaire
+nom_formulaire <- "installation_acoustic"
+
+# Fichier de sortie
+fichier_sortie <- "ODK_checks_report.txt"
+
+# Écriture dans le fichier texte
+sink(fichier_sortie, append = TRUE)  # ouvrir le fichier pour ajout (sans écrasement) d'écriture 
+
+cat("========================================\n")
+cat("FORMULAIRE :", nom_formulaire, "\n")
+cat("Rapport de vérification automatique des soumissions ODK\n")
+cat("========================================\n\n")
+
+########################################################
+
+# Résultat du check des placettes à visiter
+check <- "Placettes non-visitées en 2025 (mais qui aurait dû)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ia_plot_not_visited$`plot_2025[!(plot_2025$\`all_plot[names_grad_all %in% gradient_2025, ]\` %in% soumissions_install_acoustic_replaced$infos_plot_plot), ]`) == 0) {
+  cat("Toutes les placettes à visiter ont été visitées.\n")
+} else {
+  cat(paste("-", ia_plot_not_visited$`plot_2025[!(plot_2025$\`all_plot[names_grad_all %in% gradient_2025, ]\` %in% soumissions_install_acoustic_replaced$infos_plot_plot), ]`), sep = "\n")
+}
+
+# Résultat du check des erreurs de nom de placette
+check <- "Placettes mal nommées"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ia_plot_name_error$infos_plot_plot) == 0) {
+  cat("Aucune erreur dans le nom des placettes.\n")
+} else {
+  cat(paste("-", ia_plot_name_error$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des placettes visitées en suppléments
+check <- "Placettes visitées en supplément"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ia_plot_supplementary_visited$infos_plot_plot) == 0) {
+  cat("Aucune placette n'a été visitée en supplément.\n")
+} else {
+  cat(paste("-", ia_plot_supplementary_visited$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des doublons et manquement de noms de placette
+check <- "Placettes présentes pas 1 fois"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ia_doublons) == 0) {
+  cat("Toutes les placettes apparaissent exactement 1 fois.\n")
+} else {
+  invisible(apply(ia_doublons, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["nb_occurrences"], " occurrences\n"))
+  }))
+}
+# Résultat du check des remarques sur l'installation des acoustiques
+check <- "Remarques sur l'installation de l'acoustique détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ia_remarks) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(ia_remarks, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des éditions
+check <- "Placettes dont la soumission a été éditée"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ia_plot_edited) == 0) {
+  cat("Aucune placette éditée.\n")
+} else {
+  cat(paste("-", ia_plot_edited$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des incohérences de nomenclature des acoustiques
+check <- "Placettes dont le nom de l'acoustique ne correspond pas à la théorie (nom erroné...)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(incoherences_acoustic) == 0) {
+  cat("Tous les identifiants d'acoustiques sont conformes aux noms théoriques.\n")
+} else {
+  invisible(apply(incoherences_acoustic, 1, function(ligne) {
+    cat(paste0("- ", ligne["placette"], 
+               " → donné(s) : ", ligne["donnes"], 
+               ", attendu(s) : ", ligne["attendus"], "\n"))
+  }))
+}
+#####################################################
+
+cat("\nFin du rapport pour ce formulaire.\n\n\n")
+
+sink()  # fermer le fichier
+```
+
+## Vérification du formulaire d'intervention des camtraps et de l'acoustique
+
+### Vérification des placettes visitées
+
+On commence par vérifier que les placettes visitées dans le formulaire sont dans `plot_2025`. Si il y en a qui ne sont pas dedans on les flag. Si des placettes de `plot_2025` manque dans suivi de perturbations on le flag aussi.
+
+```{r}
+# On bosse sur une valeur des plots dans les soumissions concaténées entre les colonnes new et non new
+soumissions_intervention_camtrap_acoustic_replaced <- soumissions_intervention_camtrap_acoustic %>%
+  mutate(
+    infos_plot_plot = ifelse(infos_plot_plot == "new", infos_plot_new_plot, infos_plot_plot)
+  )
+
+# Placette non visitées alors que dans la liste des gradients à faire
+ica_plot_not_visited <- as.data.frame(plot_2025[!(plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]` %in% soumissions_intervention_camtrap_acoustic_replaced$infos_plot_plot),])
+
+# Placette avec nom erronés (pas dans les noms théorique)
+ica_plot_name_error <- soumissions_intervention_camtrap_acoustic_replaced[(!(soumissions_intervention_camtrap_acoustic_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`)&!(soumissions_intervention_camtrap_acoustic_replaced$infos_plot_plot %in%all_plot$`Data$codeplot`)),"infos_plot_plot"]
+
+# Placette visitées mais pas dans la liste des gradients à faire
+ica_plot_supplementary_visited <- soumissions_intervention_camtrap_acoustic_replaced[!(soumissions_intervention_camtrap_acoustic_replaced$infos_plot_plot %in% plot_2025$`all_plot[names_grad_all %in% gradient_2025, ]`),"infos_plot_plot"]
+
+# On enlève les erreurs de ce dataframe (car on les prend en compte avant)
+ica_plot_supplementary_visited <- ica_plot_supplementary_visited[!ica_plot_supplementary_visited$infos_plot_plot %in% ica_plot_name_error$infos_plot_plot, , drop = FALSE]
+```
+
+On va aussi noter les placettes visitées en doublons.
+
+```{r}
+ica_doublons <- soumissions_intervention_camtrap_acoustic_replaced %>%
+  dplyr::group_by(infos_plot_plot) %>%
+  dplyr::summarise(nb_occurrences = n(), .groups = "drop") %>%
+  dplyr::filter(nb_occurrences != 3)
+```
+
+On va vérifier que les appareils installés ont tous été récupéré et flaggé ceux non récupérés. On va donc comparé les noms des placettes des formulaires d'installation à ceux des placettes d'intervention.
+
+```{r}
+appareil_installed <- c(placette_acoustic, placette_camtraps)
+
+# On prend en compte que les retrieval et les volés
+appareil_retrieved <- soumissions_intervention_camtrap_acoustic_replaced[soumissions_intervention_camtrap_acoustic_replaced$infos_camtrap_intervention_type %in% c("retrieval", "stolen"),]$infos_plot_plot
+
+# Comptage des occurrences
+appareil_installed_df <- as.data.frame(table(appareil_installed))
+appareil_retrieved_df <- as.data.frame(table(appareil_retrieved))
+
+# Fusion des deux comptages
+comparaison <- full_join(appareil_installed_df, appareil_retrieved_df, by = c("appareil_installed" = "appareil_retrieved"), suffix = c("_1", "_2")) %>%
+  mutate(
+    Freq_1 = ifelse(is.na(Freq_1), 0, Freq_1),
+    Freq_2 = ifelse(is.na(Freq_2), 0, Freq_2),
+    diff = Freq_1 - Freq_2
+  )
+
+# Différences entre installées et récupérées (dans installés mais pas dans récupérés)
+diff_installed_vs_retrieved <- comparaison %>% filter(diff > 0)
+
+# Différences entre récupérées et installées (dans récupérés mais pas dans installés)
+diff_retrieved_vs_installed <- comparaison %>% filter(diff < 0)
+```
+
+### Remarques notées
+
+On note les remarques sur les interventions sur les camtraps et acoustique.
+
+```{r}
+# Nom des colonnes où chercher des remarques
+cols_remarques <- c("infos_camtrap_damaged_remarks", "infos_camtrap_remarks")  # à adapter en fonction du formulaire
+
+ica_remarks <- soumissions_intervention_camtrap_acoustic_replaced %>%
+  dplyr::mutate(
+    remarque_concat = apply(
+      dplyr::select(., all_of(cols_remarques)), 
+      1, 
+      function(x) {
+        vals <- x
+        noms <- cols_remarques
+        # nettoyage des noms : on retire prefixe et suffixe
+        noms_clean <- gsub("^infos_|_remarks$", "", noms)
+        non_vides <- which(!is.na(vals) & vals != "")
+        if (length(non_vides) == 0) return("")
+        remarques_nom <- paste0(noms_clean[non_vides], ": ", vals[non_vides])
+        paste(remarques_nom, collapse = " | ")
+      }
+    )
+  ) %>%
+  dplyr::filter(remarque_concat != "") %>%
+  dplyr::select(infos_plot_plot, remarque = remarque_concat)
+```
+
+### Formulaire Edition
+
+On récupère les placettes éditées.
+
+```{r}
+ica_plot_edited <- soumissions_intervention_camtrap_acoustic_replaced %>%
+  dplyr::filter(system_review_state == "edited") %>%
+  dplyr::select(infos_plot_plot)
+```
+
+### Vérification des noms théoriques lors de la récupérations des caméras et acoustiques
+
+```{r}
+incoherences_intervention <- lapply(unique(soumissions_intervention_camtrap_acoustic_replaced$infos_plot_plot), function(placette) {
+  
+  lignes <- soumissions_intervention_camtrap_acoustic_replaced %>%
+    filter(infos_plot_plot == placette)
+  
+  # Noms donnés dans le formulaire
+  noms_donnes <- sort(unique(na.omit(trimws(lignes$infos_camtrap_id_camtrap))))
+  if (length(noms_donnes) == 0) return(NULL)
+  
+  # Noms théoriques attendus
+  noms_attendus <- sort(unique(na.omit(c(
+    all_plot_theoric_name$acoustique[all_plot_theoric_name$`Data$codeplot` == placette],
+    all_plot_theoric_name$cam1[all_plot_theoric_name$`Data$codeplot` == placette],
+    all_plot_theoric_name$cam2[all_plot_theoric_name$`Data$codeplot` == placette]
+  ))))
+  
+  # Vérification d'orthographe sensible à la casse
+  mauvais_noms <- noms_donnes[!noms_donnes %in% noms_attendus]
+  
+  # Spot seulement si au moins un nom est mal orthographié
+  if (length(mauvais_noms) > 0) {
+    list(
+      placette = placette,
+      noms_mal_orthographiés = paste(mauvais_noms, collapse = ", "),
+      donnes = paste(noms_donnes, collapse = ", "),
+      attendus = paste(noms_attendus, collapse = ", ")
+    )
+  } else {
+    NULL
+  }
+}) %>%
+  purrr::compact() %>%
+  dplyr::bind_rows()
+```
+
+### Ecriture de l'output
+
+```{r}
+# Nom du formulaire
+nom_formulaire <- "intervention_camtrap_acoustique"
+
+# Fichier de sortie
+fichier_sortie <- "ODK_checks_report.txt"
+
+# Écriture dans le fichier texte
+sink(fichier_sortie, append = TRUE)  # ouvrir le fichier pour ajout (sans écrasement) d'écriture 
+
+cat("========================================\n")
+cat("FORMULAIRE :", nom_formulaire, "\n")
+cat("Rapport de vérification automatique des soumissions ODK\n")
+cat("========================================\n\n")
+
+########################################################
+
+# Résultat du check des placettes à visiter
+check <- "Placettes non-visitées en 2025 (mais qui aurait dû)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ica_plot_not_visited$`plot_2025[!(plot_2025$\`all_plot[names_grad_all %in% gradient_2025, ]\` %in% soumissions_intervention_camtrap_acoustic_replaced$infos_plot_plot), ]`) == 0) {
+  cat("Toutes les placettes à visiter ont été visitées.\n")
+} else {
+  cat(paste("-", ica_plot_not_visited$`plot_2025[!(plot_2025$\`all_plot[names_grad_all %in% gradient_2025, ]\` %in% soumissions_intervention_camtrap_acoustic_replaced$infos_plot_plot), ]`), sep = "\n")
+}
+
+# Résultat du check des erreurs de nom de placette
+check <- "Placettes mal nommées"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ica_plot_name_error$infos_plot_plot) == 0) {
+  cat("Aucune erreur dans le nom des placettes.\n")
+} else {
+  cat(paste("-", ica_plot_name_error$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des placettes visitées en suppléments
+check <- "Placettes visitées en supplément"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if(length(ica_plot_supplementary_visited$infos_plot_plot) == 0) {
+  cat("Aucune placette n'a été visitée en supplément.\n")
+} else {
+  cat(paste("-", ica_plot_supplementary_visited$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des doublons et manquement de noms de placette
+check <- "Placettes présentes pas 3 fois (doublons + manque de visite + pas installé)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ica_doublons) == 0) {
+  cat("Toutes les placettes apparaissent 3 fois exactement.\n")
+} else {
+  invisible(apply(ica_doublons, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["nb_occurrences"], " occurrences\n"))
+  }))
+}
+
+# Résultat du check appareils installés mais pas récupéré
+check <- "Incohérences entre appareils installés et dans le formulaire d'intervention"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(diff_installed_vs_retrieved) == 0 && nrow(diff_retrieved_vs_installed) == 0) {
+  cat("Aucune différence entre installés et récupérés.\n")
+} else {
+  if (nrow(diff_installed_vs_retrieved) > 0) {
+    cat("\nPlacettes avec plus d'occurrences dans la liste d'installation :\n")
+    invisible(apply(diff_installed_vs_retrieved, 1, function(ligne) {
+      cat(paste0("- ", ligne["appareil_installed"], " : ", ligne["diff"], " occurrence(s) en plus dans la liste d'installation que dans la liste d'intervention\n"))
+    }))
+  }
+  if (nrow(diff_retrieved_vs_installed) > 0) {
+    cat("\nPlacettes avec plus d'occurrences dans la liste d'intervention :\n")
+    invisible(apply(diff_retrieved_vs_installed, 1, function(ligne) {
+      cat(paste0("- ", ligne["appareil_installed"], " : ", abs(as.numeric(ligne["diff"])), " occurrence(s) en plus dans la liste d'intervention que dans la liste d'installation\n"))
+    }))
+  }
+}
+
+# Résultat du check des remarques sur les interventions sur les caméras et acoustiques
+check <- "Remarques sur l'intervention de l'acoustique et des caméras détectées dans les soumissions"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ica_remarks) == 0) {
+  cat("Aucune remarque détectée.\n")
+} else {
+   invisible(apply(ica_remarks, 1, function(ligne) {
+    cat(paste0("- ", ligne["infos_plot_plot"], " : ", ligne["remarque"], "\n"))
+  }))
+}
+
+# Résultat du check des éditions
+check <- "Placettes dont la soumission a été éditée"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(ica_plot_edited) == 0) {
+  cat("Aucune placette éditée.\n")
+} else {
+  cat(paste("-", ica_plot_edited$infos_plot_plot), sep = "\n")
+}
+
+# Résultat du check des incohérences de nomenclature des récupérations de caméra et acoustique
+check <- "Placettes dont le nom des caméras ou l'acoustique ne correspond pas à la théorie (nom erroné...)"
+
+cat("\n# Check effectué :", check, "\n")
+cat("# Résultat :\n")
+
+if (nrow(incoherences_intervention) == 0) {
+  cat("Tous les identifiants d'acoustiques sont conformes aux noms théoriques.\n")
+} else {
+  invisible(apply(incoherences_intervention, 1, function(ligne) {
+    cat(paste0("- ", ligne["placette"], 
+               " → donné(s) : ", ligne["donnes"], 
+               ", attendu(s) : ", ligne["attendus"], "\n"))
+  }))
+}
+#####################################################
+
+cat("\nFin du rapport pour ce formulaire.\n\n\n")
+
+sink()  # fermer le fichier
+```
